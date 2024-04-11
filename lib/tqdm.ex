@@ -26,6 +26,11 @@ defmodule Tqdm do
   left: 00:00:07, 84.71 iters/sec]
   """
 
+  # How many iteration times to keep for calculating the moving average.
+  @max_iteration_times 100
+  # Exponential smoothing factor. Larger values increase recency bias.
+  @iteration_time_smoothing 0.5
+
   @type option ::
           {:description, String.t()}
           | {:total, non_neg_integer}
@@ -90,6 +95,9 @@ defmodule Tqdm do
         start_time: now,
         last_print_time: now,
         last_printed_length: 0,
+        last_iteration_time: now,
+        iteration_times: Tqdm.LimitedList.new(@max_iteration_times),
+        time_per_iteration: nil,
         prefix: options |> Keyword.get(:description, "") |> prefix(),
         total: Keyword.get_lazy(options, :total, get_total),
         clear: Keyword.get(options, :clear, true),
@@ -109,8 +117,26 @@ defmodule Tqdm do
   defp prefix(""), do: ""
   defp prefix(description), do: description <> ": "
 
+  defp update_iteration_times(state, now \\ System.monotonic_time()) do
+    delta = now - state.last_iteration_time
+
+    %{
+      state
+      | iteration_times: Tqdm.LimitedList.push(state.iteration_times, delta),
+        last_iteration_time: now
+    }
+  end
+
   defp do_tqdm(element, %{n: 0} = state) do
-    {[element], %{print_status(state, System.monotonic_time()) | n: 1}}
+    now = System.monotonic_time()
+
+    state =
+      state
+      |> estimate_time_per_iteration()
+      |> print_status(now)
+      |> update_iteration_times(now)
+
+    {[element], %{state | n: 1}}
   end
 
   defp do_tqdm(
@@ -118,25 +144,26 @@ defmodule Tqdm do
          %{n: n, last_print_n: last_print_n, min_iterations: min_iterations} = state
        )
        when n - last_print_n < min_iterations,
-       do: {[element], %{state | n: n + 1}}
+       do: {[element], update_iteration_times(%{state | n: n + 1})}
 
   defp do_tqdm(element, state) do
     now = System.monotonic_time()
-
-    time_diff =
-      now - state.last_print_time
+    time_diff = now - state.last_print_time
 
     state =
       if time_diff >= state.min_interval do
-        Map.merge(print_status(state, now), %{
+        state
+        |> estimate_time_per_iteration()
+        |> print_status(now)
+        |> Map.merge(%{
           last_print_n: state.n,
-          last_print_time: System.monotonic_time()
+          last_print_time: now
         })
       else
         state
       end
 
-    {[element], %{state | n: state.n + 1}}
+    {[element], update_iteration_times(%{state | n: state.n + 1}, now)}
   end
 
   defp do_tqdm_after(state) do
@@ -167,18 +194,29 @@ defmodule Tqdm do
     %{state | last_printed_length: status_length}
   end
 
-  defp format_status(state, now) do
-    elapsed =
-      System.convert_time_unit(now - state.start_time, :native, :microsecond)
+  defp estimate_time_per_iteration(state) do
+    moving_avg = state.iteration_times |> Tqdm.LimitedList.avg() |> native_to_seconds()
 
-    elapsed_str = format_interval(elapsed, false)
+    time_per_iteration =
+      if state.time_per_iteration && moving_avg do
+        moving_avg * (1 - @iteration_time_smoothing) +
+          state.time_per_iteration * @iteration_time_smoothing
+      else
+        moving_avg
+      end
 
-    rate = format_rate(elapsed, state.n)
-
-    format_status(state, elapsed, rate, elapsed_str)
+    %{state | time_per_iteration: time_per_iteration}
   end
 
-  defp format_status(state, elapsed, rate, elapsed_str) do
+  defp native_to_seconds(nil), do: nil
+
+  defp native_to_seconds(dur),
+    do: System.convert_time_unit(round(dur), :native, :microsecond) / 1_000_000
+
+  defp format_status(state, now) do
+    elapsed_str = format_interval(native_to_seconds(now - state.start_time))
+    rate = format_rate(state)
+
     n = state.n
     total = state.total
     total_segments = state.total_segments
@@ -187,12 +225,10 @@ defmodule Tqdm do
       progress = n / total
 
       num_segments = trunc(progress * total_segments)
-
       bar = format_bar(num_segments, total_segments)
-
       percentage = "#{Float.round(progress * 100)}%"
 
-      left = format_left(n, elapsed, total)
+      left = format_left(state)
 
       "|#{bar}| #{n}/#{total} #{percentage} " <>
         "[elapsed: #{elapsed_str} left: #{left}, #{rate} iters/sec]"
@@ -201,31 +237,25 @@ defmodule Tqdm do
     end
   end
 
-  defp format_rate(elapsed, n) when elapsed > 0,
-    do: Float.round(n / (elapsed / 1_000_000), 2)
-
-  defp format_rate(_elapsed, _n),
-    do: "?"
+  defp format_rate(%{time_per_iteration: nil}), do: "0"
+  defp format_rate(%{time_per_iteration: tpi}), do: Float.round(1 / tpi, 2)
 
   defp format_bar(num_segments, total_segments) do
     String.duplicate("#", num_segments) <>
       String.duplicate("-", total_segments - num_segments)
   end
 
-  defp format_left(n, elapsed, total) when n > 0,
-    do: format_interval(elapsed / n * (total - n), true)
+  defp format_left(%{time_per_iteration: nil}), do: "?"
 
-  defp format_left(_n, _elapsed, _total),
-    do: "?"
+  defp format_left(%{time_per_iteration: tpi, n: n, total: total}),
+    do: format_interval(tpi * (total - n))
 
-  defp format_interval(elapsed, trunc_seconds) do
-    minutes = trunc(elapsed / 60_000_000)
+  defp format_interval(elapsed) do
+    minutes = trunc(elapsed / 60)
     hours = div(minutes, 60)
     rem_minutes = minutes - hours * 60
-    micro_seconds = elapsed - minutes * 60_000_000
-    seconds = micro_seconds / 1_000_000
-
-    seconds = if trunc_seconds, do: trunc(seconds), else: seconds
+    micro_seconds = elapsed - minutes * 60
+    seconds = trunc(micro_seconds)
 
     hours_str = format_time_component(hours)
     minutes_str = format_time_component(rem_minutes)
