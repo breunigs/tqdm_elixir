@@ -27,9 +27,9 @@ defmodule Tqdm do
   """
 
   # How many iteration times to keep for calculating the moving average.
-  @max_iteration_times 100
-  # Exponential smoothing factor. Larger values increase recency bias.
-  @iteration_time_smoothing 0.5
+  @max_iteration_times 250
+  # Exponential smoothing factor. Smaller values increase recency bias.
+  @iteration_time_smoothing 0.8
 
   @type option ::
           {:description, String.t()}
